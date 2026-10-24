@@ -1,25 +1,29 @@
 # RetroESP32-P4 OTA Multi-Binary Partition Table (16 MB flash)
 #
-# Binary sizes (measured):
-#   launcher=706KB  nes=567KB  gb=539KB  sms=1231KB  spectrum=665KB
-#   stella=1184KB  prosystem=575KB  handy=535KB  pce=575KB
-#   atari800=734KB  opentyrian=662KB  snes=869KB  genesis=1212KB
-#   neogeo=1177KB
+# Binary sizes (measured, 2026-10-24):
+#   launcher=729KB  nes=583KB  gb=555KB  sms=1247KB  spectrum=682KB
+#   stella=1199KB  prosystem=591KB  handy=550KB  pce=661KB
+#   atari800=750KB  snes=822KB  genesis=1230KB
+#   neogeo=1270KB
+#
+# 2026-10-24: ota_0 (NES) enlarged from 0x90000 to 0xA0000 because enabling
+#   CONFIG_ESP_ERR_TO_NAME_LOOKUP=y added ~7KB to every app; nes was the only
+#   one close enough to its limit to overflow. ota_1..ota_12 shifted +0x10000.
 #
 # Name,     Type, SubType, Offset,    Size,    Flags
 nvs,        data, nvs,     0x9000,    0x4000,
 otadata,    data, ota,     0xD000,    0x2000,
 factory,    app,  factory, 0x10000,   0x0C0000,
-ota_0,      app,  ota_0,   0x0D0000,  0x090000,
-ota_1,      app,  ota_1,   0x160000,  0x0A0000,
-ota_2,      app,  ota_2,   0x200000,  0x150000,
-ota_3,      app,  ota_3,   0x350000,  0x0C0000,
-ota_4,      app,  ota_4,   0x410000,  0x140000,
-ota_5,      app,  ota_5,   0x550000,  0x0A0000,
-ota_6,      app,  ota_6,   0x5F0000,  0x0A0000,
-ota_7,      app,  ota_7,   0x690000,  0x0B0000,
-ota_8,      app,  ota_8,   0x740000,  0x0C0000,
-ota_9,      app,  ota_9,   0x800000,  0x0C0000,
-ota_10,     app,  ota_10,  0x8C0000,  0x0F0000,
-ota_11,     app,  ota_11,  0x9B0000,  0x150000,
-ota_12,     app,  ota_12,  0xB00000,  0x180000,
+ota_0,      app,  ota_0,   0x0D0000,  0x0A0000,
+ota_1,      app,  ota_1,   0x170000,  0x0A0000,
+ota_2,      app,  ota_2,   0x210000,  0x150000,
+ota_3,      app,  ota_3,   0x360000,  0x0C0000,
+ota_4,      app,  ota_4,   0x420000,  0x140000,
+ota_5,      app,  ota_5,   0x560000,  0x0A0000,
+ota_6,      app,  ota_6,   0x600000,  0x0A0000,
+ota_7,      app,  ota_7,   0x6A0000,  0x0B0000,
+ota_8,      app,  ota_8,   0x750000,  0x0C0000,
+ota_9,      app,  ota_9,   0x810000,  0x0C0000,
+ota_10,     app,  ota_10,  0x8D0000,  0x0F0000,
+ota_11,     app,  ota_11,  0x9C0000,  0x150000,
+ota_12,     app,  ota_12,  0xB10000,  0x180000,

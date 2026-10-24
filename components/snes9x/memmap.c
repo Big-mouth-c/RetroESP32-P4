@@ -259,32 +259,47 @@ static char* Safe(const char* s)
 bool S9xInitMemory(void)
 {
 
-   /* Buffer placement tuned for CPU speed (Phase 50):
+   /* Buffer placement tuned for CPU speed + USB host DMA headroom (Phase 50+):
     *  - RAM (WRAM + 65816 stack) — hottest, touched nearly every instruction → internal.
-    *  - VRAM — read every scanline during rendering (render-heavy scenes are
-    *    VRAM-bound) → internal. To keep an internal-SRAM safety margin, FillRAM
-    *    (32 KB, below) moves to PSRAM to make room, leaving ~50 KB free.
-    *  - SRAM — cold battery save → PSRAM (was internal only for the removed
-    *    SuperFX GSU framebuffer).
-    * Hot buffers fall back to PSRAM if internal RAM is exhausted. */
+    *  - VRAM (64 KB) — read every scanline during rendering.
+    *    MOVED TO PSRAM: keeping it internal (128 KB RAM + 64 KB VRAM = 192 KB)
+    *    starves the USB host stack of DMA-capable internal RAM. When the Zikway
+    *    3-interface gamepad's iface 2 opens (~4 s after boot, after ROM load),
+    *    hcd_pipe_alloc() fails with ESP_ERR_NO_MEM → iface 2 never starts →
+    *    gamepad dead. VRAM in PSRAM costs ~1–2 ms/frame in rendering (still
+    *    inside the 16.67 ms budget at 59–60 FPS).
+    *  - bytes0x2000 (8 KB) — $06:$0000 mirror / DMA scratch → PSRAM (extra margin).
+    *  - SRAM — cold battery save → PSRAM.
+    *  - FillRAM (32 KB) → PSRAM.
+    *  This leaves ~110 KB of contiguous internal RAM free for USB DMA pipes.
+    *  RAM stays internal (CPU-bound). TileCache/TileCached stay internal
+    *  (small, render-scratch). */
    Memory.RAM   = (uint8_t*) heap_caps_calloc(1, RAM_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);  // 128 KB WRAM (hot)
    if (!Memory.RAM)
       Memory.RAM = (uint8_t*) heap_caps_calloc(1, RAM_SIZE, MALLOC_CAP_SPIRAM);
    Memory.SRAM  = (uint8_t*) heap_caps_calloc(1, SRAM_SIZE, MALLOC_CAP_SPIRAM);  // 128 KB battery save (cold)
+   /* ---- 原代码：VRAM 在内部 RAM（导致 USB 主机 DMA 内存不足）----
    Memory.VRAM  = (uint8_t*) heap_caps_calloc(1, VRAM_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);  // 64 KB (hot, render)
    if (!Memory.VRAM)
       Memory.VRAM = (uint8_t*) heap_caps_calloc(1, VRAM_SIZE, MALLOC_CAP_SPIRAM);
+   ---- 原代码结束 ---- */
+   /* 修复：VRAM 移到 PSRAM，释放 64KB 内部 RAM 给 USB host DMA 管道分配 */
+   Memory.VRAM  = (uint8_t*) heap_caps_calloc(1, VRAM_SIZE, MALLOC_CAP_SPIRAM);  // 64 KB → PSRAM (USB DMA headroom)
    printf("SNES MEM: RAM=%p VRAM=%p SRAM=%p (P4 internal SRAM ~0x4FFxxxxx, PSRAM 0x48xxxxxx)\n",
           Memory.RAM, Memory.VRAM, Memory.SRAM);
 // allocated when actually loading the ROM
 //   Memory.ROM   = (uint8_t*) heap_caps_calloc(1, MAX_ROM_SIZE + 0x200, MALLOC_CAP_SPIRAM);
-   Memory.FillRAM = (uint8_t*) heap_caps_malloc(0x8000, MALLOC_CAP_SPIRAM);  // 32 KB → PSRAM (frees internal for VRAM)
+   Memory.FillRAM = (uint8_t*) heap_caps_malloc(0x8000, MALLOC_CAP_SPIRAM);  // 32 KB → PSRAM
 
    IPPU.TileCache = (uint8_t*) heap_caps_calloc(1, MAX_2BIT_TILES * 2, MALLOC_CAP_INTERNAL);  // 8KB 128 fcipaq
    IPPU.TileCached = (uint8_t*) heap_caps_calloc(1, MAX_2BIT_TILES, MALLOC_CAP_INTERNAL);  // 4KB
 
+   /* ---- 原代码：bytes0x2000 在内部 RAM ----
    bytes0x2000 = (uint8_t *) heap_caps_calloc(1, 0x2000, MALLOC_CAP_INTERNAL);  // 8 KB
-   // 308 KB
+   ---- 原代码结束 ---- */
+   /* 修复：bytes0x2000 移到 PSRAM，再释放 8KB 内部 RAM */
+   bytes0x2000 = (uint8_t *) heap_caps_calloc(1, 0x2000, MALLOC_CAP_SPIRAM);  // 8 KB → PSRAM
+   // internal: RAM(128) + TileCache(8) + TileCached(4) = 140 KB; PSRAM: VRAM(64) + SRAM(128) + FillRAM(32) + bytes0x2000(8)
 
    if (!Memory.RAM || !Memory.VRAM || !Memory.SRAM || !Memory.FillRAM //|| !Memory.ROM
       || !IPPU.TileCache || !IPPU.TileCached || !bytes0x2000)

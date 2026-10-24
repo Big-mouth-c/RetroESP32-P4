@@ -96,6 +96,49 @@ static void crash_guard_timer_cb(TimerHandle_t xTimer)
     xTimerDelete(xTimer, 0);
 }
 
+/* ─── Cold-boot guard: only a launcher-triggered restart enters a game ──── */
+/*
+ * 启动流程：launcher 把 OTA 启动分区切到对应模拟器并 esp_restart()。
+ * 这样下次上电时 bootloader 会直接启动该模拟器分区 → 直接进入上次的游戏。
+ *
+ * 需求：断电重启/异常复位后应回到 launcher（模拟器选择界面）。
+ *
+ * 判定依据 esp_reset_reason()：
+ *   ESP_RST_SW     —— 由 launcher 主动 esp_restart() 触发（唯一允许直接进游戏的路径）
+ *   其余（POWERON/BROWNOUT/PANIC/WDT/UNKNOWN…）—— 冷启动或异常复位，回 launcher
+ *
+ * 这里只用分区 API + esp_restart()，不碰 LCD/USB，因此可以在硬件初始化之前调用。
+ */
+static void boot_guard_check(void)
+{
+    esp_reset_reason_t reason = esp_reset_reason();
+
+    if (reason == ESP_RST_SW) {
+        ESP_LOGI(TAG, "boot_guard: launched by launcher (ESP_RST_SW) — entering game");
+        return;
+    }
+
+    ESP_LOGW(TAG, "boot_guard: non-launcher reset (reason=%d) — restoring launcher boot partition",
+             (int)reason);
+
+    const esp_partition_t *factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        ESP_PARTITION_SUBTYPE_APP_FACTORY,
+        NULL);
+    if (factory != NULL) {
+        esp_err_t err = esp_ota_set_boot_partition(factory);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "boot_guard: set factory boot partition failed (%s)", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGE(TAG, "boot_guard: factory partition not found!");
+    }
+
+    /* 立即重启回到 launcher（此时屏幕尚未点亮，不会有白屏闪动） */
+    esp_restart();
+    /* Does not return */
+}
+
 /* ─── Full hardware init ──────────────────────────────────────── */
 void app_init(void)
 {
@@ -108,6 +151,10 @@ void app_init(void)
         nvs_flash_erase();
         nvs_flash_init();
     }
+
+    /* 1b. Cold-boot guard: power-on / abnormal reset → back to launcher.
+     *     Must run BEFORE hardware init so the return is fast. */
+    boot_guard_check();
 
     /* 2. Crash-guard: detect crash loops BEFORE hardware init */
     crash_guard_check();

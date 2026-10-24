@@ -73,6 +73,11 @@
 #include "gamepad.h"
 
 /*
+  CJK Font (中文 ROM 文件名 UTF-8 渲染)
+*/
+#include "cnfont.h"
+
+/*
   Touch Panel
 */
 #ifndef CONFIG_HDMI_OUTPUT

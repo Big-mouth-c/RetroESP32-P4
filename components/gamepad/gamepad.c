@@ -109,10 +109,16 @@ static gp_report_format_t detect_format(const uint8_t *data, int len)
 	// 0x054C 0x0CE6 Sony DualSense (PS5)
 	// 0x0079 0x0006 PC TWIN SHOCK Gamepad/Generic USB Gamepad
 	// 0x0810 0x0001 Dual PSX Adaptor
+	// 0x3537 0x1041 Zikway HID Gamepad
 
 	// Step 1: Use the VID/PID combo to identify known controllers.
 	if (len == 8 && s_vid == 0x0810 && s_pid == 0x0001) {
 		return GP_FORMAT_DUAL_PSX_ADAPTOR;
+	}
+
+	// Zikway HID Gamepad (11 bytes, Report ID 0x01)
+	if (s_vid == 0x3537 && s_pid == 0x1041) {
+		return GP_FORMAT_GENERIC;
 	}
 
 	/* Short report with ID 0x01: likely PS4/PS5 or clone (some clones use same format but generic VID/PID) */
@@ -208,6 +214,55 @@ static void parse_gamepad_report(const uint8_t *data, int len)
         int copy_len = (len > 64) ? 64 : len;
         memcpy(s_raw_dump_buf, data, copy_len);
         s_raw_dump_len = copy_len;
+    }
+
+    /* ========================= Zikway HID Gamepad (0x3537:0x1041) =========================
+     * 多接口手柄，报告格式固定（11 字节，Report ID 0x01）：
+     *   [0]=0x01  [1]=LX  [2]=LY  [3]=RX  [4]=RY  [5]=hat  [6]=按键1  [7]=按键2  [8]=L2  [9]=R2
+     * 在通用格式检测之前强制处理，处理完直接返回（不进入 PS4/PS5/通用启发式检测）。 */
+    if (s_vid == 0x3537 && s_pid == 0x1041) {
+        if (len >= 6) {
+            gamepad_state_t gs;
+            memset(&gs, 0, sizeof(gs));
+            gs.connected = 1;
+
+            /* 摇杆轴: [1]=LX [2]=LY [3]=RX [4]=RY */
+            gs.axis_lx = (int16_t)data[1] - 128;
+            gs.axis_ly = (int16_t)data[2] - 128;
+            gs.axis_rx = (int16_t)data[3] - 128;
+            gs.axis_ry = (int16_t)data[4] - 128;
+
+            /* 十字键: byte[5] 低半字节 hat 值 */
+            gs.dpad = hat_to_dpad(data[5] & 0x0F);
+
+            /* 按键: byte[6] 和 byte[7] */
+            if (len >= 8) {
+                if (data[6] & 0x01) gs.buttons |= GAMEPAD_BTN_A;
+                if (data[6] & 0x02) gs.buttons |= GAMEPAD_BTN_B;
+                if (data[6] & 0x10) gs.buttons |= GAMEPAD_BTN_X;
+                if (data[6] & 0x08) gs.buttons |= GAMEPAD_BTN_Y;
+                if (data[6] & 0x20) gs.buttons |= GAMEPAD_BTN_L1;
+                if (data[6] & 0x40) gs.buttons |= GAMEPAD_BTN_R1;
+                if (data[6] & 0x04) gs.buttons |= GAMEPAD_BTN_L2;
+                if (data[6] & 0x80) gs.buttons |= GAMEPAD_BTN_R2;
+                if (data[7] & 0x04) gs.buttons |= GAMEPAD_BTN_SELECT;
+                if (data[7] & 0x08) gs.buttons |= GAMEPAD_BTN_START;
+                if (data[7] & 0x01) gs.buttons |= GAMEPAD_BTN_L3;
+                if (data[7] & 0x02) gs.buttons |= GAMEPAD_BTN_R3;
+                if (data[7] & 0x10) gs.buttons |= GAMEPAD_BTN_HOME;
+            }
+
+            /* 模拟扳机: [8]=L2 [9]=R2 (0-255 → 0-1020) */
+            if (len >= 10) {
+                gs.brake    = ((uint16_t)data[8]) << 2;
+                gs.throttle = ((uint16_t)data[9]) << 2;
+            }
+
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            memcpy(&s_state, &gs, sizeof(gs));
+            xSemaphoreGive(s_mutex);
+        }
+        return; /* Zikway 已处理，不进入通用格式检测 */
     }
 
     /* Auto-detect format from first few reports — NO LOGGING here (USB callback context) */
@@ -401,8 +456,16 @@ static void hid_interface_cb(hid_host_device_handle_t hid_dev,
         if (err == ESP_OK && data_len > 0) {
             hid_host_dev_params_t params;
             hid_host_device_get_params(hid_dev, &params);
-            /* Only parse non-keyboard, non-mouse devices */
-            if (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE) {
+            /* ---- 原代码：仅解析非键鼠设备（Zikway 集成时保留备份）----
+            // if (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE) {
+            //     parse_gamepad_report(data, (int)data_len);
+            // }
+            ---- 原代码结束 ---- */
+
+            /* Zikway 集成：Zikway (0x3537:0x1041) 的游戏数据接口可能枚举为
+             * keyboard/mouse 等协议，因此对 Zikway 跳过协议过滤，解析所有接口的报告 */
+            bool is_zikway = (s_vid == 0x3537 && s_pid == 0x1041);
+            if (is_zikway || (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE)) {
                 parse_gamepad_report(data, (int)data_len);
             }
         }
@@ -583,14 +646,36 @@ static void gamepad_task(void *arg)
 
                 if (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE) {
                     ESP_LOGI(TAG, "==> Gamepad detected!");
+                }
 
-                    /* Retrieve VID/PID for controller identification */
-                    hid_host_dev_info_t dev_info;
-                    if (hid_host_get_device_info(evt.hid_handle, &dev_info) == ESP_OK) {
-                        s_vid = dev_info.VID;
-                        s_pid = dev_info.PID;
-                        ESP_LOGI(TAG, "Gamepad VID=0x%04X PID=0x%04X", s_vid, s_pid);
-                    }
+                /* ---- 原代码：仅对非键鼠接口读取 VID/PID（Zikway 集成时改为始终读取）----
+                // if (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE) {
+                //     ESP_LOGI(TAG, "==> Gamepad detected!");
+                //
+                //     Retrieve VID/PID for controller identification
+                //     hid_host_dev_info_t dev_info;
+                //     if (hid_host_get_device_info(evt.hid_handle, &dev_info) == ESP_OK) {
+                //         s_vid = dev_info.VID;
+                //         s_pid = dev_info.PID;
+                //         ESP_LOGI(TAG, "Gamepad VID=0x%04X PID=0x%04X", s_vid, s_pid);
+                //     }
+                // }
+                ---- 原代码结束 ---- */
+
+                /* Zikway 集成：无论接口类型如何，始终读取 VID/PID。
+                 * Zikway (0x3537:0x1041) 是多接口设备，游戏数据接口的枚举协议可能不是
+                 * gamepad，必须在任何接口的报告到达之前就设置好 VID/PID 用于路由。 */
+                hid_host_dev_info_t dev_info;
+                if (hid_host_get_device_info(evt.hid_handle, &dev_info) == ESP_OK) {
+                    s_vid = dev_info.VID;
+                    s_pid = dev_info.PID;
+                    ESP_LOGI(TAG, "HID VID=0x%04X PID=0x%04X (iface=%d, proto=%s)",
+                             s_vid, s_pid, params.iface_num, proto_names[proto_idx]);
+                }
+
+                bool is_zikway = (s_vid == 0x3537 && s_pid == 0x1041);
+                if (is_zikway) {
+                    ESP_LOGI(TAG, "===== ZIKWAY GAMEPAD DETECTED (iface %d) =====", params.iface_num);
                 }
 
                 /* Open device and configure interface callback */
@@ -599,15 +684,54 @@ static void gamepad_task(void *arg)
                     .callback_arg = NULL,
                 };
 
-                esp_err_t err = hid_host_device_open(evt.hid_handle, &dev_config);
+                /* Zikway 修复：接口 claim（内部会向 HCD 申请端点/管道）在枚举时序紧张时
+                 * 可能偶发失败，日志表现为 "EP allocation error" → "Unable to claim
+                 * interface"。原代码一次失败就 continue，该接口永久丢失；对 Zikway 而言
+                 * iface 2 打不开 → s_state.connected 永不置位 → 手柄彻底无响应。
+                 * 改为重试 3 次，仍失败才放弃。 */
+                esp_err_t err = ESP_FAIL;
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    err = hid_host_device_open(evt.hid_handle, &dev_config);
+                    if (err == ESP_OK) {
+                        if (attempt > 0) {
+                            ESP_LOGI(TAG, "hid_host_device_open OK (attempt %d)", attempt + 1);
+                        }
+                        break;
+                    }
+                    ESP_LOGW(TAG, "hid_host_device_open failed (attempt %d): %s (0x%X)",
+                             attempt + 1, esp_err_to_name(err), err);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                }
                 if (err != ESP_OK) {
-                    ESP_LOGW(TAG, "hid_host_device_open failed: %s", esp_err_to_name(err));
+                    ESP_LOGE(TAG, "hid_host_device_open giving up (iface %d): %s (0x%X)",
+                             params.iface_num, esp_err_to_name(err), err);
                     continue;
                 }
 
                 /* Boot-interface devices: set protocol */
                 if (HID_SUBCLASS_BOOT_INTERFACE == params.sub_class) {
                     hid_class_request_set_protocol(evt.hid_handle, HID_REPORT_PROTOCOL_BOOT);
+                }
+
+                /* Zikway 集成：对 Zikway 强制切换到 REPORT 协议，
+                 * 否则游戏数据接口可能停留在 boot 协议，收不到完整的输入报告。
+                 * 设置失败不阻塞（best-effort，中断 IN 端点不受影响）。
+                 *
+                 * Zikway 修复：不再对 iface 1（键盘接口）发送 SET_PROTOCOL。
+                 * 实测该接口必然返回 STALL，并把 EP0 控制管道打入
+                 * "HCD Pipe not in active state"，而 iface 0/2 都能正常切换。
+                 * 键盘接口本项目不使用，跳过可避免污染 EP0。 */
+                /* ---- 原代码：对所有接口都发送 SET_PROTOCOL ----
+                if (is_zikway) {
+                ---- 原代码结束 ---- */
+                if (is_zikway && params.iface_num != 1) {
+                    esp_err_t proto_err = hid_class_request_set_protocol(evt.hid_handle, HID_REPORT_PROTOCOL_REPORT);
+                    if (proto_err != ESP_OK) {
+                        ESP_LOGW(TAG, "Zikway: set protocol failed (iface %d): %s — continuing",
+                                 params.iface_num, esp_err_to_name(proto_err));
+                    } else {
+                        ESP_LOGI(TAG, "Zikway: iface %d protocol set to REPORT", params.iface_num);
+                    }
                 }
 
                 /* NOTE: Removed SET_IDLE — PS4/PS5 gamepads may STALL this request,
@@ -638,6 +762,17 @@ static void gamepad_task(void *arg)
                     continue;
                 }
 
+                /* Zikway 集成：打印报告描述符（一次性调试信息，便于确认各接口的报告格式） */
+                if (is_zikway) {
+                    size_t desc_len = 0;
+                    uint8_t *report_desc = hid_host_get_report_descriptor(evt.hid_handle, &desc_len);
+                    if (report_desc && desc_len > 0) {
+                        ESP_LOGI(TAG, "Zikway: iface %d report descriptor (len=%zu):",
+                                 params.iface_num, desc_len);
+                        ESP_LOG_BUFFER_HEX_LEVEL(TAG, report_desc, desc_len, ESP_LOG_INFO);
+                    }
+                }
+
                 /* Genuine Sony DualShock 3 (Sixaxis) needs the operational-mode enable
                  * before it can stream input over USB. Sent AFTER device_start so the
                  * host is already polling the interrupt-IN endpoint. (Even so, this pad
@@ -648,8 +783,19 @@ static void gamepad_task(void *arg)
                     ds3_enable_operational(evt.hid_handle);
                 }
 
-                /* Mark connected for gamepad devices */
-                if (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE) {
+                /* ---- 原代码：仅非键鼠协议接口标记已连接（Zikway 集成时保留备份）----
+                // if (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE) {
+                //     xSemaphoreTake(s_mutex, portMAX_DELAY);
+                //     s_state.connected = 1;
+                //     xSemaphoreGive(s_mutex);
+                // }
+                ---- 原代码结束 ---- */
+
+                /* Zikway 集成：Zikway 的游戏数据来自接口 2（可能枚举为非 gamepad 协议），
+                 * 因此 Zikway 在接口 2 启动后即标记已连接；其他设备仍按协议过滤。
+                 * （首份输入报告到达时 parse 也会置 connected=1） */
+                if (is_zikway ? (params.iface_num == 2) :
+                    (params.proto != HID_PROTOCOL_KEYBOARD && params.proto != HID_PROTOCOL_MOUSE)) {
                     xSemaphoreTake(s_mutex, portMAX_DELAY);
                     s_state.connected = 1;
                     xSemaphoreGive(s_mutex);
@@ -675,6 +821,8 @@ esp_err_t gamepad_init(const gamepad_config_t *config)
     s_format_log_pending = 0;
     s_raw_dump_count = 0;
     s_raw_dump_len = 0;
+    s_vid = 0;   /* Zikway 集成：复位设备识别状态 */
+    s_pid = 0;
 
     s_mutex = xSemaphoreCreateMutex();
     if (!s_mutex) return ESP_ERR_NO_MEM;
@@ -763,6 +911,8 @@ void gamepad_deinit(void)
     s_usb_task = NULL;
     s_gp_task = NULL;
     memset(&s_state, 0, sizeof(s_state));
+    s_vid = 0;   /* Zikway 集成：复位设备识别状态 */
+    s_pid = 0;
 }
 
 void gamepad_get_state(gamepad_state_t *state)

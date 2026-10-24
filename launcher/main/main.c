@@ -202,6 +202,13 @@
     odroid_sdcard_open("/sd");
     create_settings();
 
+    /* 中文字体：打开 SD 卡上的预生成点阵字库（约 2.6MB，按需读单字，
+     * PSRAM 仅占约 84KB 索引），用于显示中文 ROM 文件名。
+     * 失败不阻塞启动，draw_text 会自动回退到 '?' 渲染。 */
+    if (cnfont_init("/sd/fonts/cnfont32.bin", 32) != ESP_OK) {
+      printf("中文字库不可用（/sd/fonts/cnfont32.bin），中文名将显示为 ?\n");
+    }
+
     // PSRAM XIP Self-Test (verify PSRAM code execution works)
     psram_app_selftest();
 
@@ -667,9 +674,10 @@
     return dx;
   }
 
+  /* ---- 原 draw_text（仅 ASCII，中文显示为 ?）— UTF-8 中文字体集成时保留备份 ----
   void draw_text(short x, short y, char *string, bool ext, bool current, bool remove) {
     int length = !ext ? strlen(string) : strlen(string)-(strlen(EXTENSIONS[STEP])+1);
-    /* Clamp to visible area: each char is 20px wide (16+4 gap) at 2x scale */
+    // Clamp to visible area: each char is 20px wide (16+4 gap) at 2x scale
     int max_chars = (WIDTH - 10 - x) / 20;
     if (max_chars < 1) max_chars = 1;
     if (max_chars > 40) max_chars = 40;
@@ -694,6 +702,115 @@
         ili9341_write_frame_rectangleLE(x, y, 16, 32, buffer);
       }
       x += ch != ' ' ? 20 : 10;
+    }
+  }
+  ---- 原代码结束 ---- */
+
+  /* RGB565 alpha 混合：前景色 fg 按覆盖率 a(0..255) 叠加到背景色 bg */
+  static uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
+    if (a == 0)   return bg;
+    if (a == 255) return fg;
+    uint32_t fr=(fg>>11)&0x1F, fgm=(fg>>5)&0x3F, fb=fg&0x1F;
+    uint32_t br=(bg>>11)&0x1F, bgm=(bg>>5)&0x3F, bb=bg&0x1F;
+    uint32_t r = (fr*a + br*(255-a)) >> 8;
+    uint32_t g = (fgm*a + bgm*(255-a)) >> 8;
+    uint32_t b = (fb*a + bb*(255-a)) >> 8;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+  }
+
+  /* 绘制单个 ASCII 字符（FONT_8x16 位图 2x 放大 = 16x32），返回水平步进像素 */
+  static int draw_ascii_glyph(short x, short y, char ch, bool current, bool remove) {
+    if (ch != ' ') {
+      int glyph = (ch >= 32 && ch <= 126) ? ch - 32 : '?' - 32;
+      int i = 0;
+      for (int row = 0; row < 16; row++) {
+        uint8_t bits = FONT_8x16[glyph][row];
+        for (int sr = 0; sr < 2; sr++) {
+          for (int col = 7; col >= 0; col--) {
+            uint16_t pixel = (bits & (1 << col))
+              ? (current ? GUI.hl : GUI.fg) : GUI.bg;
+            if (remove) pixel = GUI.bg;
+            buffer[i++] = pixel;
+            buffer[i++] = pixel;
+          }
+        }
+      }
+      ili9341_write_frame_rectangleLE(x, y, 16, 32, buffer);
+    }
+    return ch != ' ' ? 20 : 10;
+  }
+
+  /*
+   * draw_text — UTF-8 版本
+   * ASCII（单字节）走原 8x16 位图字体；非 ASCII（中文等 2/3/4 字节）
+   * 走 cnfont 的 TTF 光栅化（带字形缓存）。字体不可用时自动回退 '?'。
+   */
+  void draw_text(short x, short y, char *string, bool ext, bool current, bool remove) {
+    int total_len = (int)strlen(string);
+    int byte_limit = !ext ? total_len : total_len - ((int)strlen(EXTENSIONS[STEP]) + 1);
+    if (byte_limit < 0) byte_limit = 0;
+    if (byte_limit > total_len) byte_limit = total_len;
+
+    int n = 0;
+    while (n < byte_limit) {
+      uint32_t cp;
+      int used = cnfont_utf8_decode(string + n, &cp);
+      if (used == 0) { n++; continue; }  /* 非法字节，跳过 */
+
+      /* ASCII：原 8x16 位图路径 */
+      if (!cnfont_is_wide(cp)) {
+        int step = (cp != ' ') ? 20 : 10;
+        if (x + step > WIDTH - 2) break;
+        draw_ascii_glyph(x, y, (char)cp, current, remove);
+        x += step;
+        n += used;
+        continue;
+      }
+
+      /* 非 ASCII（中文等）：点阵字库渲染；字库未就绪/无此字形时回退 '?' */
+      const cnfont_glyph_t *g = cnfont_get_glyph(cp);
+      if (!g) {
+        if (x + 20 > WIDTH - 2) break;
+        draw_ascii_glyph(x, y, '?', current, remove);
+        x += 20;
+        n += used;
+        continue;
+      }
+
+      int step = g->advance + 2;  /* 字形步进 + 2px 字间距 */
+      if (x + step > WIDTH - 2) break;
+
+      if (remove) {
+        draw_mask(x, y, step, 32);
+      } else if (g->w > 0 && g->h > 0) {
+        uint16_t fg = current ? GUI.hl : GUI.fg;
+        uint16_t bg = GUI.bg;
+
+        /* ---- 原实现：TTF 8-bit 抗锯齿 alpha 混合（点阵方案后停用）----
+        int i = 0;
+        for (int r = 0; r < g->h; r++) {
+          const uint8_t *row_alpha = &g->alpha[r * g->w];
+          for (int c = 0; c < g->w; c++) {
+            buffer[i++] = blend565(fg, bg, row_alpha[c]);
+          }
+        }
+        ---- 原实现结束 ---- */
+
+        /* 1bpp 点阵：与 FONT_8x16 同样的逐位画法（32x32=1024 像素） */
+        int stride = g->w / 8;
+        int i = 0;
+        for (int r = 0; r < g->h; r++) {
+          for (int b = 0; b < stride; b++) {
+            uint8_t bits = g->data[r * stride + b];
+            for (int bit = 0; bit < 8; bit++) {
+              buffer[i++] = (bits & (0x80 >> bit)) ? fg : bg;
+            }
+          }
+        }
+        ili9341_write_frame_rectangleLE(x + g->xoff, y + g->yoff, g->w, g->h, buffer);
+      }
+      x += step;
+      n += used;
     }
   }
 

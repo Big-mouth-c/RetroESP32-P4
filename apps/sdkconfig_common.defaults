@@ -37,6 +37,8 @@ CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
 # FAT filesystem — long filenames (required for ROM file paths)
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
+# Use UTF-8 encoding for FATFS API (supports Chinese ROM filenames)
+CONFIG_FATFS_API_ENCODING_UTF_8=y
 
 # Optimizations
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
